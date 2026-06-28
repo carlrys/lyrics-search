@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Jupyter / Colab
+*.ipynb_checkpoints/
+.ipynb_checkpoints/
+
+# Large artifact files — include only if you want them baked into the image.
+# Otherwise leave them out and mount via docker-compose volumes.
+# lyric_search_artifacts/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Git
+.git/
+.gitignore
+
+# Docs
+README.md
+*.md

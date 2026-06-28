@@ -1,0 +1,9 @@
+services:
+  lyric-search:
+    build: .
+    ports:
+      - "8501:8501"
+    volumes:
+      # Mount artifacts folder from host — useful if artifacts are not committed to git
+      - ./lyric_search_artifacts:/app/lyric_search_artifacts
+    restart: unless-stopped
