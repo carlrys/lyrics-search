@@ -26,8 +26,8 @@ Run the app on any machine with Docker — no Python, no pip, no environment set
 ### Step 1 — Clone the repository
 
 ```bash
-git clone https://github.com/your-username/your-repo-name.git
-cd your-repo-name
+git clone https://github.com/carlrys/lyrics-search.git
+cd lyrics-search
 ```
 
 ### Step 2 — Create the data folder
@@ -43,7 +43,7 @@ Copy `songs_lyrics_metadata.csv` and `songs.index` (both downloaded from Google 
 Your folder should now look like this:
 
 ```
-your-repo-name/
+lyrics-search/
 ├── Dockerfile
 ├── docker-compose.yml
 ├── .dockerignore
