@@ -4,6 +4,7 @@ FROM python:3.11-slim
 RUN apt-get update && apt-get install -y \
     libopenblas-dev \
     libgomp1 \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -12,11 +13,17 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy app files
+# Copy app code
 COPY streamlit_app.py .
 
-# Copy artifacts if they exist locally — otherwise mount at runtime (see docker-compose)
-COPY lyric_search_artifacts/ ./lyric_search_artifacts/
+# Data files (corpus CSV + FAISS index) are NOT copied here —
+# they're large/binary and expected to be mounted at runtime via docker-compose.
+# See docker-compose.yml volumes section.
+
+# Default paths inside the container — match the sidebar defaults in streamlit_app.py
+ENV LYRICS_CSV_PATH=/app/data/songs_lyrics_metadata.csv
+ENV LYRICS_INDEX_PATH=/app/data/songs.index
+ENV SBERT_MODEL_NAME=sentence-transformers/all-MiniLM-L6-v2
 
 EXPOSE 8501
 

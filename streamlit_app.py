@@ -1,32 +1,26 @@
 """
 🎵 Lyric Search — Streamlit App
-Supports TF-IDF, BM25, and Sentence-BERT + FAISS retrieval.
+Matches the `complete_pipeline.ipynb` backend: BM25 (sparse) + SBERT/FAISS (dense).
 
 Usage:
     streamlit run streamlit_app.py
 
-Artifacts required (produced by the Colab notebook):
-    lyric_search_artifacts/
-        tfidf_vectorizer.pkl
-        tfidf_matrix.pkl
-        bm25.pkl
-        faiss.index
-        embeddings.npy
-        metadata.parquet
-        config.json
+Required files (produced by the Colab notebook):
+    songs_lyrics_metadata.csv   ← original corpus + metadata (title, artist, tag, lyrics_clean)
+    songs.index                 ← FAISS index built from SBERT embeddings
+
+Set the paths below or via environment variables / sidebar file uploader.
 """
 
 import re
-import json
-import pickle
-import textwrap
+import os
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import faiss
 import streamlit as st
-from sklearn.metrics.pairwise import cosine_similarity
+from rank_bm25 import BM25Okapi
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -42,7 +36,6 @@ st.markdown("""
 @import url('https://fonts.googleapis.com/css2?family=Playfair+Display:wght@700;900&family=DM+Sans:wght@300;400;500&display=swap');
 
 html, body, [class*="css"] { font-family: 'DM Sans', sans-serif; }
-
 h1, h2, h3 { font-family: 'Playfair Display', serif; }
 
 .stApp { background: #0d0d14; color: #e8e4f0; }
@@ -83,6 +76,17 @@ section[data-testid="stSidebar"] {
 }
 .song-artist { font-size: 0.88rem; color: #9b93c9; margin-bottom: 0.6rem; }
 
+.tag-pill {
+    display: inline-block;
+    background: #1e2a3a;
+    color: #7cc3f5;
+    font-size: 0.7rem;
+    padding: 2px 9px;
+    border-radius: 12px;
+    border: 1px solid #2d4a5e;
+    margin-right: 6px;
+}
+
 .score-pill {
     display: inline-block;
     background: #252240;
@@ -103,7 +107,6 @@ section[data-testid="stSidebar"] {
     letter-spacing: 0.05em;
     margin-left: 6px;
 }
-.badge-tfidf  { background: #1e3a3a; color: #5ecfb3; border: 1px solid #2d5e55; }
 .badge-bm25   { background: #3a2810; color: #f5a623; border: 1px solid #5e4218; }
 .badge-sbert  { background: #2a1e3a; color: #c47cf5; border: 1px solid #4a2e65; }
 
@@ -162,9 +165,16 @@ div[data-testid="stTextInput"] input:focus {
 </style>
 """, unsafe_allow_html=True)
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
-ARTIFACTS = Path("lyric_search_artifacts")
+# ── Config ────────────────────────────────────────────────────────────────────
+# These map to the notebook's DRIVE_BASE / CSV_PATH / INDEX_PATH.
+# Override via environment variables, or drop the files next to this script.
+DEFAULT_CSV_PATH   = os.environ.get("LYRICS_CSV_PATH", "songs_lyrics_metadata.csv")
+DEFAULT_INDEX_PATH = os.environ.get("LYRICS_INDEX_PATH", "songs.index")
+SBERT_MODEL_NAME    = os.environ.get("SBERT_MODEL_NAME", "sentence-transformers/all-MiniLM-L6-v2")
+# When running in Docker, LYRICS_CSV_PATH / LYRICS_INDEX_PATH are set to
+# /app/data/... via the Dockerfile and fed by the docker-compose volume mount.
 
+# ── Helpers ───────────────────────────────────────────────────────────────────
 def clean_lyrics(text: str) -> str:
     if not isinstance(text, str):
         return ""
@@ -173,141 +183,123 @@ def clean_lyrics(text: str) -> str:
     text = re.sub(r"\s+", " ", text).strip()
     return text
 
-def lyric_preview(text: str, max_chars: int = 200) -> str:
+
+def lyric_preview(text: str, max_chars: int = 220) -> str:
     if not isinstance(text, str):
         return ""
-    # Show first few meaningful lines
     lines = [l.strip() for l in text.split("\n") if l.strip()]
-    preview = "\n".join(lines[:5])
-    return textwrap.shorten(preview, width=max_chars, placeholder="…")
+    preview = " ".join(lines[:5]) if len(lines) <= 1 else "\n".join(lines[:5])
+    if len(preview) > max_chars:
+        preview = preview[:max_chars].rsplit(" ", 1)[0] + "…"
+    return preview
 
-# ── Load artifacts (cached) ───────────────────────────────────────────────────
-@st.cache_resource(show_spinner="Loading retrieval models…")
-def load_artifacts():
-    if not ARTIFACTS.exists():
+
+# ── Load resources (cached) ──────────────────────────────────────────────────
+@st.cache_resource(show_spinner="Loading corpus, BM25 index, SBERT model, and FAISS index…")
+def load_resources(csv_path: str, index_path: str, model_name: str):
+    if not Path(csv_path).exists():
+        return None
+    if not Path(index_path).exists():
         return None
 
-    with open(ARTIFACTS / "tfidf_vectorizer.pkl", "rb") as f:
-        tfidf_vec = pickle.load(f)
-    with open(ARTIFACTS / "tfidf_matrix.pkl", "rb") as f:
-        tfidf_mat = pickle.load(f)
-    with open(ARTIFACTS / "bm25.pkl", "rb") as f:
-        bm25 = pickle.load(f)
+    df = pd.read_csv(csv_path)
+    df = df.reset_index(drop=True)
+    df["id"] = df.index.astype(str)
 
-    faiss_idx = faiss.read_index(str(ARTIFACTS / "faiss.index"))
-    embeddings = np.load(ARTIFACTS / "embeddings.npy")
-    metadata = pd.read_parquet(ARTIFACTS / "metadata.parquet")
+    # Match the notebook's column fallback logic
+    lyrics_col = "lyrics_clean" if "lyrics_clean" in df.columns else df.columns[-1]
 
-    with open(ARTIFACTS / "config.json") as f:
-        config = json.load(f)
+    from sentence_transformers import SentenceTransformer
+    model = SentenceTransformer(model_name)
 
-    # Load SBERT lazily (requires sentence-transformers)
-    try:
-        from sentence_transformers import SentenceTransformer
-        sbert = SentenceTransformer(config["sbert_model"])
-    except Exception:
-        sbert = None
+    index = faiss.read_index(index_path)
+
+    corpus = df[lyrics_col].fillna("").tolist()
+    tokenized = [doc.lower().split() for doc in corpus]
+    bm25 = BM25Okapi(tokenized)
 
     return {
-        "tfidf_vec": tfidf_vec,
-        "tfidf_mat": tfidf_mat,
+        "df": df,
+        "model": model,
+        "index": index,
         "bm25": bm25,
-        "faiss_idx": faiss_idx,
-        "embeddings": embeddings,
-        "metadata": metadata,
-        "config": config,
-        "sbert": sbert,
+        "lyrics_col": lyrics_col,
     }
 
 
-def tfidf_search(query: str, arts, top_k: int) -> list[dict]:
-    q_vec = arts["tfidf_vec"].transform([clean_lyrics(query)])
-    scores = cosine_similarity(q_vec, arts["tfidf_mat"]).flatten()
-    idx = np.argsort(scores)[::-1][:top_k]
-    meta = arts["metadata"]
-    return [
-        {
-            "rank": i + 1,
-            "title": meta.iloc[j]["title"],
-            "artist": meta.iloc[j]["artist"],
-            "score": float(scores[j]),
-            "lyrics": meta.iloc[j]["lyrics"],
-        }
-        for i, j in enumerate(idx)
-    ]
+# ── Search functions (mirror notebook's search_sbert / search_bm25) ─────────
+def search_sbert(query_text: str, res: dict, k: int) -> list[dict]:
+    embedding = res["model"].encode([query_text], normalize_embeddings=True)
+    distances, indices = res["index"].search(embedding, k)
+    df = res["df"]
+    results = []
+    for rank, (idx, score) in enumerate(zip(indices[0], distances[0]), start=1):
+        if idx < 0 or idx >= len(df):
+            continue
+        row = df.iloc[int(idx)]
+        results.append({
+            "rank": rank,
+            "title": row.get("title", "Unknown"),
+            "artist": row.get("artist", "Unknown"),
+            "tag": row.get("tag", ""),
+            "score": float(score),
+            "lyrics": row.get(res["lyrics_col"], ""),
+        })
+    return results
 
 
-def bm25_search(query: str, arts, top_k: int) -> list[dict]:
-    tokens = clean_lyrics(query).split()
-    scores = np.array(arts["bm25"].get_scores(tokens))
-    idx = np.argsort(scores)[::-1][:top_k]
-    meta = arts["metadata"]
-    return [
-        {
-            "rank": i + 1,
-            "title": meta.iloc[j]["title"],
-            "artist": meta.iloc[j]["artist"],
-            "score": float(scores[j]),
-            "lyrics": meta.iloc[j]["lyrics"],
-        }
-        for i, j in enumerate(idx)
-    ]
-
-
-def dense_search(query: str, arts, top_k: int) -> list[dict]:
-    if arts["sbert"] is None:
-        st.error("sentence-transformers not installed in this environment.")
-        return []
-    q_emb = arts["sbert"].encode(
-        [clean_lyrics(query)],
-        normalize_embeddings=True,
-        convert_to_numpy=True,
-    ).astype(np.float32)
-    scores, indices = arts["faiss_idx"].search(q_emb, top_k)
-    meta = arts["metadata"]
-    return [
-        {
-            "rank": i + 1,
-            "title": meta.iloc[j]["title"],
-            "artist": meta.iloc[j]["artist"],
-            "score": float(s),
-            "lyrics": meta.iloc[j]["lyrics"],
-        }
-        for i, (j, s) in enumerate(zip(indices[0], scores[0]))
-    ]
+def search_bm25(query_text: str, res: dict, k: int) -> list[dict]:
+    tokens = query_text.lower().split()
+    scores = res["bm25"].get_scores(tokens)
+    top_indices = scores.argsort()[::-1][:k]
+    df = res["df"]
+    results = []
+    for rank, idx in enumerate(top_indices, start=1):
+        if idx < 0 or idx >= len(df):
+            continue
+        row = df.iloc[int(idx)]
+        results.append({
+            "rank": rank,
+            "title": row.get("title", "Unknown"),
+            "artist": row.get("artist", "Unknown"),
+            "tag": row.get("tag", ""),
+            "score": float(scores[idx]),
+            "lyrics": row.get(res["lyrics_col"], ""),
+        })
+    return results
 
 
 MODEL_META = {
-    "TF-IDF": {
-        "fn": tfidf_search,
-        "badge": "badge-tfidf",
-        "label": "TF-IDF",
-        "desc": "Term frequency-inverse document frequency. Fast, lexical matching.",
-    },
-    "BM25": {
-        "fn": bm25_search,
-        "badge": "badge-bm25",
-        "label": "BM25",
-        "desc": "Okapi BM25 — improved sparse ranking with document length normalisation.",
-    },
     "SBERT + FAISS": {
-        "fn": dense_search,
+        "fn": search_sbert,
         "badge": "badge-sbert",
         "label": "SBERT",
-        "desc": "Sentence-BERT embeddings retrieved via FAISS. Understands semantics.",
+        "desc": "Dense retrieval via Sentence-BERT embeddings, ranked with FAISS cosine similarity.",
+    },
+    "BM25": {
+        "fn": search_bm25,
+        "badge": "badge-bm25",
+        "label": "BM25",
+        "desc": "Sparse retrieval baseline — lexical term matching with length normalisation.",
     },
 }
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("### ⚙️ Search Settings")
+
+    with st.expander("📂 Data paths", expanded=False):
+        csv_path = st.text_input("Corpus CSV path", value=DEFAULT_CSV_PATH)
+        index_path = st.text_input("FAISS index path", value=DEFAULT_INDEX_PATH)
+        st.caption("These match `CSV_PATH` and `INDEX_PATH` from the notebook config.")
+
     chosen_model = st.radio(
         "Retrieval Model",
         list(MODEL_META.keys()),
-        index=2,
+        index=0,
         help="Choose the retrieval algorithm.",
     )
-    top_k = st.slider("Results to return", min_value=3, max_value=20, value=8)
+    top_k = st.slider("Results to return", min_value=3, max_value=20, value=10)
     show_lyrics = st.toggle("Show lyric preview", value=True)
     st.divider()
     st.markdown(
@@ -316,38 +308,43 @@ with st.sidebar:
     st.divider()
     st.markdown("##### How it works")
     st.markdown(
-        "1. Run the Colab notebook on your CSV to build retrieval artifacts.\n"
-        "2. Place the `lyric_search_artifacts/` folder next to this file.\n"
-        "3. Enter a lyric fragment or semantic description to search."
+        "1. Run `complete_pipeline.ipynb` in Colab on your corpus.\n"
+        "2. Make sure `songs_lyrics_metadata.csv` and `songs.index` are accessible "
+        "(same folder as this app, or set custom paths above).\n"
+        "3. Enter a lyric fragment or a descriptive/emotional query to search."
     )
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 st.markdown('<div class="hero-title">🎵 Lyric Search</div>', unsafe_allow_html=True)
 st.markdown(
-    '<p style="color:#7a748f;font-size:1rem;margin-top:0.3rem">Search songs by lyric fragments or describe what you\'re looking for.</p>',
+    '<p style="color:#7a748f;font-size:1rem;margin-top:0.3rem">Search songs by lyric fragments, themes, or emotions.</p>',
     unsafe_allow_html=True,
 )
 st.markdown("")
 
-arts = load_artifacts()
+resources = load_resources(csv_path, index_path, SBERT_MODEL_NAME)
 
-if arts is None:
+if resources is None:
     st.warning(
-        "**Artifacts not found.** Run the Colab notebook first, then place the "
-        "`lyric_search_artifacts/` folder in the same directory as this app.",
+        f"**Required files not found.**\n\n"
+        f"- Looking for corpus CSV at: `{csv_path}`\n"
+        f"- Looking for FAISS index at: `{index_path}`\n\n"
+        "Run `complete_pipeline.ipynb` first, then place `songs_lyrics_metadata.csv` "
+        "and `songs.index` next to this app (or update the paths in the sidebar).",
         icon="⚠️",
     )
     st.stop()
 
 # Stats bar
-cfg = arts["config"]
-meta = arts["metadata"]
+df = resources["df"]
+n_artists = df["artist"].nunique() if "artist" in df.columns else "—"
+n_tags = df["tag"].nunique() if "tag" in df.columns else "—"
 c1, c2, c3, c4 = st.columns(4)
 for col, num, label in [
-    (c1, f"{cfg['corpus_size']:,}", "Songs in corpus"),
-    (c2, cfg["sbert_model"], "SBERT model"),
-    (c3, f"{cfg['embedding_dim']}d", "Embedding dim"),
-    (c4, "3", "Retrieval models"),
+    (c1, f"{len(df):,}", "Songs in corpus"),
+    (c2, f"{n_artists:,}" if isinstance(n_artists, int) else n_artists, "Unique artists"),
+    (c3, f"{n_tags}" if n_tags == "—" else f"{n_tags:,}", "Genres / tags"),
+    (c4, "2", "Retrieval models"),
 ]:
     col.markdown(
         f'<div class="stat-box"><div class="stat-num">{num}</div>'
@@ -362,7 +359,7 @@ qcol, bcol = st.columns([6, 1])
 with qcol:
     query = st.text_input(
         "Search query",
-        placeholder="e.g.  'heart of gold'  or  'feeling lost on the highway'",
+        placeholder="e.g. 'feeling numb after a long period of emotional pain'",
         label_visibility="collapsed",
     )
 with bcol:
@@ -372,7 +369,7 @@ with bcol:
 if (search_btn or query) and query.strip():
     model_info = MODEL_META[chosen_model]
     with st.spinner(f"Searching with {chosen_model}…"):
-        results = model_info["fn"](query.strip(), arts, top_k)
+        results = model_info["fn"](query.strip(), resources, top_k)
 
     badge_html = f'<span class="model-badge {model_info["badge"]}">{model_info["label"]}</span>'
     st.markdown(
@@ -386,15 +383,15 @@ if (search_btn or query) and query.strip():
     else:
         for r in results:
             preview = lyric_preview(r["lyrics"]) if show_lyrics else ""
-            preview_block = (
-                f'<div class="lyric-preview">{preview}</div>' if preview else ""
-            )
+            preview_block = f'<div class="lyric-preview">{preview}</div>' if preview else ""
+            tag_block = f'<span class="tag-pill">{r["tag"]}</span>' if r.get("tag") else ""
             st.markdown(
                 f"""
                 <div class="result-card">
                     <span class="rank-badge">#{r['rank']}</span>
                     <div class="song-title">{r['title']}</div>
                     <div class="song-artist">{r['artist']}</div>
+                    {tag_block}
                     <span class="score-pill">score {r['score']:.4f}</span>
                     {preview_block}
                 </div>
@@ -407,6 +404,6 @@ elif not query.strip() and search_btn:
 else:
     st.markdown(
         '<p style="color:#3d3852;text-align:center;margin-top:4rem;font-size:0.9rem">'
-        "Type a lyric or describe a feeling to begin searching…</p>",
+        "Type a lyric, theme, or feeling to begin searching…</p>",
         unsafe_allow_html=True,
     )

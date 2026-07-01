@@ -4,6 +4,8 @@ services:
     ports:
       - "8501:8501"
     volumes:
-      # Mount artifacts folder from host — useful if artifacts are not committed to git
-      - ./lyric_search_artifacts:/app/lyric_search_artifacts
+      # Mount your local data folder containing songs_lyrics_metadata.csv and songs.index
+      # into /app/data inside the container. The app reads these via
+      # LYRICS_CSV_PATH and LYRICS_INDEX_PATH (set in the Dockerfile).
+      - ./data:/app/data:ro
     restart: unless-stopped

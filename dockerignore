@@ -17,10 +17,15 @@ env/
 # Jupyter / Colab
 *.ipynb_checkpoints/
 .ipynb_checkpoints/
+*.ipynb
 
-# Large artifact files — include only if you want them baked into the image.
-# Otherwise leave them out and mount via docker-compose volumes.
-# lyric_search_artifacts/
+# Data files — mounted at runtime via docker-compose, not baked into the image
+data/
+*.csv
+*.index
+annotation_pool.xlsx
+annotation_pool_raw.csv
+*.png
 
 # OS
 .DS_Store
